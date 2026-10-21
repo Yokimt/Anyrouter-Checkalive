@@ -28,10 +28,13 @@ concurrency:
   group: keepalive
   cancel-in-progress: false
 
+# Why two jobs: GitHub caps a single job at 6 hours (360 minutes), so an
+# 8-hour window is built from a ~6h job followed by a ~2h job. Set the
+# repository variable KEEPALIVE_EXTEND=false to keep only the first segment.
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6h max, the script self-terminates at ~5h58m
+    timeout-minutes: 360  # hard GitHub limit; the script stops at ~5h58m
     env:
       # Secrets live in Settings -> Secrets and variables -> Actions.
       # GitHub never prompts for them, and they are never workflow inputs.
@@ -57,5 +60,39 @@ jobs:
       - name: Check configuration
         run: bash scripts/preflight.sh
 
-      - name: Run keepalive for all keys
+      - name: Run keepalive for all keys (part 1/2)
+        run: bash scripts/run-all.sh
+
+  keepalive-continue:
+    needs: keepalive
+    # Runs even if part 1 failed, so a bad key cannot silently cut the window
+    # short. Set the repository variable KEEPALIVE_EXTEND=false to disable.
+    if: ${{ always() && vars.KEEPALIVE_EXTEND != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150  # 2h30m, the script stops at ~2h
+    env:
+      CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
+      BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
+      MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
+      API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
+      QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+      QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
+      SLEEP_BETWEEN_ROUNDS: ${{ vars.SLEEP_BETWEEN_ROUNDS }}
+      SLEEP_BETWEEN_TOKENS: ${{ vars.SLEEP_BETWEEN_TOKENS }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify tooling
+        run: |
+          jq --version
+          curl --version | head -n 1
+
+      - name: Check configuration
+        run: bash scripts/preflight.sh
+
+      - name: Run keepalive for all keys (part 2/2)
+        env:
+          # Fixed 2h budget for this segment (step env overrides job env).
+          MAX_DURATION_SEC: "7200"
         run: bash scripts/run-all.sh

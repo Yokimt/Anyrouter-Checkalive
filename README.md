@@ -71,7 +71,7 @@ x-client-request-id: <uuid4>
 
 ### 保活 / 恢复监控
 
-- **Keepalive**：每天 UTC 18:00（北京时间 02:00）起一个 6 小时容器，内部每 ~50 分钟轮询全部 key，结束发汇总邮件。
+- **Keepalive**：每天 UTC 18:00（北京时间 02:00）起一个 ~8 小时窗口（6h 主段 + 2h 续段），内部每 ~50 分钟轮询全部 key，每段结束发一封汇总邮件。
 - **Recovery Monitor**：手动起 6 小时容器，每 30 分钟一轮、每轮发邮件；全部 key 正常且最大响应 < 30 秒时发「快用」邮件并提前退出。
 - 每轮 key 之间 30 秒 ± 10 秒抖动，避免瞬时并发。
 
@@ -148,6 +148,21 @@ Actions 页面 → “I understand my workflows, go ahead and enable them”。
 
 想立刻验证链路，直接点 **Run workflow** （等价于 `workflow_dispatch`），或临时把 cron 改成 `*/5 * * * *` 推上去、验证完再改回来。
 
+### 8 小时窗口是怎么来的
+
+GitHub 对**单个 job** 有 6 小时（360 分钟）硬上限 —— `MAX_DURATION_SEC=28800` 也会在第 6 小时被强制终止。所以 8 小时由两个 job 串起来：
+
+| 段 | job | 时长预算 | 说明 |
+|---|---|---|---|
+| 1/2 | `keepalive` | ~5h58m（21500s） | 主段，`timeout-minutes: 360` |
+| 2/2 | `keepalive-continue` | 2h（7200s） | `needs` 接在主段之后，`timeout-minutes: 150` |
+
+- 两段之间会有几十秒到几分钟的空档（job 排队 + checkout），不是严格无缝。
+- 每段结束各发一封汇总邮件（一天两封）。
+- 主段即使失败，续段仍会执行（`always()`），避免一个坏 key 把窗口砍短。
+- **退回 6 小时**：Settings → Variables 加 `KEEPALIVE_EXTEND = false`，续段就不跑了。
+- 想更长就再串一个 job，但要按每天 480 分钟以上计算 Actions 消耗。
+
 ## 调整启动时间
 
 **硬限制**：`on.schedule.cron` 只接受字面量 —— 不能用 `${{ vars.* }}`、secret 或 `Run workflow` 的输入框动态生成。启动时间必须写进 YAML，这是 GitHub 的规则。
@@ -187,7 +202,7 @@ git add -A && git commit -m "chore: keepalive start at 02:00 Beijing" && git pus
 | 20:00 | 12:00 | `0 12 * * *` |
 | 23:30 | 15:30 | `30 15 * * *` |
 
-一次保活是 6 小时容器：02:00 启动就意味着 02:00–08:00 持续在跑，起得越早越要算 Actions 分钟数。
+一次保活默认约 8 小时（6h + 2h 两段）：02:00 启动意味着 02:00–10:00 持续在跑，起得越早越要算 Actions 分钟数。
 
 ### 不用改文件的部分
 
@@ -196,6 +211,7 @@ git add -A && git commit -m "chore: keepalive start at 02:00 Beijing" && git pus
 | Variable | 含义 | 默认 |
 |---|---|---|
 | `MAX_DURATION_SEC` | 单次运行时长上限 | 21500（≈5h58m） |
+| `KEEPALIVE_EXTEND` | 设为 `false` 关闭第 2 段（退回 6h） | 开启 |
 | `SLEEP_BETWEEN_ROUNDS` | 保活轮间隔秒数 | 3000（≈50 分钟） |
 | `SLEEP_BETWEEN_TOKENS` | key 之间间隔秒数 | 30 |
 | `POLL_INTERVAL` | 监控轮间隔秒数 | 1800 |
@@ -278,7 +294,7 @@ bats tests/
 
 - **密钥安全**：key 只出现在 0600 权限的临时请求头文件里，进程退出即删；日志只打印前 5 位。不要把 key 写进 workflow 文件。
 - **成本**：每次探测是一次真实模型调用。`gpt-6-astra` 的单价请按平台计费核对；可用 `MAX_OUTPUT_TOKENS` 压低单次成本。
-- **Actions 分钟数**：每次 6 小时 ≈ 360 分钟，按天跑约 10800 分钟/月。公开仓库免费；私有仓库会远超免费额度（Free 2000 / Pro 3000）。
+- **Actions 分钟数**：每次约 8 小时 ≈ 480 分钟，按天跑约 14400 分钟/月。公开仓库免费；私有仓库会远超免费额度（Free 2000 / Pro 3000）。把仓库变量 `KEEPALIVE_EXTEND` 设为 `false` 可退回 6 小时（≈10800 分钟/月）。
 - **定时任务**：公开仓库连续 60 天无提交后 schedule 会被自动停用；fork 仓库默认不启用定时任务，需手动开启。
 - **合规**：本工具通过定时请求维持账号活跃度，属于对目标平台调度策略的自动化干预。请自行确认符合 Anyrouter/平台的服务条款与 GitHub Actions 的使用条款，风险自负。
 - **平台差异**：`gpt-6-astra` 是非标准模型名，是否可用完全取决于你配置的 `BASE_URL`；换平台时先跑一次 `keepalive-once`。
