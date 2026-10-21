@@ -1,4 +1,4 @@
-name: Anyrouter Keepalive
+name: Codex Keepalive
 
 on:
   schedule:
@@ -7,13 +7,21 @@ on:
   workflow_dispatch:
     inputs:
       base_url:
-        description: 'API Base URL'
+        description: 'Codex API base URL (or a full /responses or /chat/completions endpoint)'
         required: false
-        default: 'https://a-ocnfniawgw.cn-shanghai.fcapp.run'
+        default: 'https://anyrouter.top/v1'
       model:
-        description: 'Claude model for health checks'
+        description: 'Model name'
         required: false
-        default: 'opus[1m]'
+        default: 'gpt-6-astra'
+      api_style:
+        description: 'auto | responses | chat'
+        required: false
+        default: 'auto'
+
+# Least privilege: the job only reads the repo.
+permissions:
+  contents: read
 
 # Prevent concurrent runs stacking up
 concurrency:
@@ -23,25 +31,22 @@ concurrency:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6h max, our script self-terminates at ~5h58m
+    timeout-minutes: 360  # 6h max, the script self-terminates at ~5h58m
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Claude Code CLI
+      - name: Verify tooling
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          jq --version
+          curl --version | head -n 1
 
-      - name: Verify Claude CLI
-        run: claude --version
-
-      - name: Run keepalive for all tokens
+      - name: Run keepalive for all keys
         env:
-          ANYROUTER_TOKENS: ${{ secrets.ANYROUTER_TOKENS }}
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://a-ocnfniawgw.cn-shanghai.fcapp.run' }}
-          MODEL: ${{ github.event.inputs.model || 'opus[1m]' }}
+          CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
+          BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
+          MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
+          API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
-          CI: "true"
         run: bash scripts/run-all.sh

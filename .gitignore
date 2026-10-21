@@ -10,6 +10,10 @@
 # Other local files
 context_manager_example.py
 
+# Python / test artifacts
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 Thumbs.db

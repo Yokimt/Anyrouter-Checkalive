@@ -1,166 +1,208 @@
-# Anyrouter Keepalive
+# Codex Keepalive
 
-对 Anyrouter Claude API 中转站的多账号执行健康检查（保活）与恢复监控，通过 GitHub Actions 运行，让账号在调度队列中保持活跃状态，在使用时获得更高优先级。
+对 **Codex** 接口做多 key 健康检查（保活）与恢复监控，通过 GitHub Actions 定时运行，让账号在调度队列中保持活跃状态。默认模型 **`gpt-6-astra`**。
 
-## 工作流一览
+改造自原 Anyrouter-Claude 版本，请求形态参考 `codex_keepalive_v20`：**不安装任何 CLI**，直接用 `curl` 调 Codex 兼容的 HTTP 接口。
 
-| 工作流 | 触发方式 | 用途 |
+## 与上一版（Claude）的区别
+
+| 维度 | 上一版 | 现在 |
 |---|---|---|
-| **Keepalive** (`keepalive.yml`) | 定时 + 手动 | 每日凌晨自动保活，每 50 分钟轮询一轮 |
-| **Keepalive Once** (`keepalive-once.yml`) | 手动 | 单次快速测活（只跑一轮） |
-| **Recovery Monitor** (`monitor-recovery.yml`) | 手动 | 每 30 分钟轮询，发现恢复立刻通知，全通且响应 <30s 自动退出 |
+| 探活方式 | 装 Claude Code CLI，跑 `claude -p` | `curl` 直接 POST Codex HTTP 接口 |
+| 凭据落盘 | 每次改写并删除 `~/.claude/settings.json` | 只放在 0600 临时请求头文件里，随进程删除 |
+| 默认模型 | `opus[1m]` | `gpt-6-astra` |
+| CI 依赖 | Node + Claude CLI（每次现装） | `jq` + `curl`（ubuntu-latest 自带） |
+| 成功判定 | 退出码 + 非空输出 | HTTP 200 + 解析出的回答文本 |
 
 ## 工作原理
 
-Anyrouter 的调度策略疑似为**账号级先来先用**。如果账号长时间没有请求，可能在队列中失去优先级。本项目通过定时发起轻量 Claude API 调用让账号保持活跃。
+### 请求形态
 
-### Keepalive（保活）
+对齐参考项目 `codex_keepalive_v20`：原生 HTTP，凭证只进请求头。
 
-- 每天 **UTC 18:00（北京时间 02:00）** 启动一个 GitHub Actions 容器
-- 容器内部每 **50 分钟** 轮询一遍所有 token（避免 6 小时限制）
-- 每个 token 发送一条随机的真实工程提问，使用 `claude -p` 模式
-- 在接近 6 小时限制时自动发送汇总报告邮件
-- 可选通过 QQ 邮箱接收最终报告
+```http
+POST https://anyrouter.top/v1/responses
+Authorization: Bearer sk-xxx
+Content-Type: application/json; charset=utf-8
+Accept: text/event-stream
+User-Agent: Codex Desktop (codex-keepalive/1.0)
+originator: Codex Desktop
+session-id: <uuid4>
+thread-id: <uuid4>
+x-client-request-id: <uuid4>
+```
 
-### Recovery Monitor（恢复监控）
+```jsonc
+{
+  "model": "gpt-6-astra",
+  "stream": true,
+  "store": false,
+  "instructions": "回答下面的问题。直接给出结论……",
+  "input": [{"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "<随机提问>"}]}],
+  "max_output_tokens": 128,
+  "prompt_cache_key": "<session-id>",
+  "reasoning": {"effort": "low"},
+  "text": {"verbosity": "low"}
+}
+```
 
-- **手动触发**，启动一个 6 小时容器，每 **30 分钟** 轮询所有 token
-- 每轮结束后发送**汇总邮件**（北京时间），列出每个 token 的状态和响应时间
-- **早期退出**：当全部 token 正常且最大响应时间 < 30 秒时，发「快用！状态超好」邮件并自动终止
-- 适合等待 Anyrouter 从不可用状态恢复的场景
+`reasoning` / `text` 只在模型名以 `gpt-5` / `gpt-6` 开头时添加；`REASONING_EFFORT=`（空）可关闭。
+
+**成功判定**（与参考项目一致）：
+
+- HTTP 200 且能从 Responses / Chat Completions（JSON 或 SSE）里解析出回答文本 → 存活；
+- `status=incomplete`（输出预算用尽）**也算存活**，只记一条提示；
+- 网络错误、超时、非 200、响应体带 `error`、空回答 → 失败。
+
+### 端点推导
+
+`BASE_URL` 可以是裸主机、带 `/v1`，也可以直接是完整接口地址：
+
+| `BASE_URL` | `API_STYLE` | 实际请求 |
+|---|---|---|
+| `https://anyrouter.top` | `auto` | `https://anyrouter.top/v1/responses` |
+| `https://anyrouter.top/v1` | `auto` | `https://anyrouter.top/v1/responses` |
+| `https://anyrouter.top/v1` | `chat` | `https://anyrouter.top/v1/chat/completions` |
+| `https://x/api/responses` | `auto` | 原样使用（并锁定 responses 格式） |
+| `https://x/v1/chat/completions` | `responses` | 报错（格式冲突） |
+
+`auto` 只决定「路径怎么拼」，不会在请求失败后自动换协议：如果平台只支持 chat completions，请显式设 `API_STYLE=chat`。
+
+### 保活 / 恢复监控
+
+- **Keepalive**：每天 UTC 18:00（北京时间 02:00）起一个 6 小时容器，内部每 ~50 分钟轮询全部 key，结束发汇总邮件。
+- **Recovery Monitor**：手动起 6 小时容器，每 30 分钟一轮、每轮发邮件；全部 key 正常且最大响应 < 30 秒时发「快用」邮件并提前退出。
+- 每轮 key 之间 30 秒 ± 10 秒抖动，避免瞬时并发。
 
 ## 快速开始
 
 ### 1. Fork 仓库
 
-Fork 本仓库到你的 GitHub 账号下。
-
 ### 2. 配置 Secrets
 
-在仓库的 **Settings → Secrets and variables → Actions** 中添加：
+**Settings → Secrets and variables → Actions**：
 
-| Secret 名称 | 说明 | 是否必需 |
+| Secret | 说明 | 必需 |
 |---|---|---|
-| `ANYROUTER_TOKENS` | 你的 Anyrouter token，每行一个 | ✅ 必需 |
-| `QQ_EMAIL` | QQ 邮箱地址，用于接收报告 | ❌ 可选 |
-| `QQ_SMTP_AUTH_CODE` | QQ 邮箱 SMTP 授权码 | ❌ 可选 |
+| `CODEX_TOKENS` | Codex API key，每行一个 | ✅ |
+| `QQ_EMAIL` | 接收报告的 QQ 邮箱 | ❌ |
+| `QQ_SMTP_AUTH_CODE` | QQ 邮箱 SMTP 授权码（不是登录密码） | ❌ |
 
-**ANYROUTER_TOKENS 格式：**
-```
-sk-ant-xxx111
-sk-ant-xxx222
-sk-ant-xxx333
-```
+> 旧仓库不用改：`ANYROUTER_TOKENS` 仍然可用，工作流会按 `CODEX_TOKENS → ANYROUTER_TOKENS` 顺序回退。
 
 ### 3. 启用 Actions
 
-进入 **Actions** 页面，点击 **"I understand my workflows, go ahead and enable them"**。
+Actions 页面 → “I understand my workflows, go ahead and enable them”。
 
-| 工作流 | 手动触发路径 |
-|---|---|
-| 保活（定时） | Actions → Anyrouter Keepalive → Run workflow |
-| 保活（单次） | Actions → Anyrouter Keepalive (Once) → Run workflow |
-| 恢复监控 | Actions → Anyrouter Recovery Monitor → Run workflow |
+## 配置项
 
-**恢复监控**在手动触发时可自定义 `base_url` 和 `model`，默认使用 `opus[1m]` + FC 端点。
+全部通过环境变量（工作流里已接好输入框）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CODEX_TOKENS` | — | key 列表，换行分隔（逗号分割也兼容） |
+| `ANYROUTER_TOKENS` | — | 旧变量名，`CODEX_TOKENS` 为空时的回退 |
+| `BASE_URL` / `CODEX_BASE_URL` | `https://anyrouter.top/v1` | 接口地址，可带完整路径 |
+| `MODEL` / `CODEX_MODEL` | `gpt-6-astra` | 模型名 |
+| `API_STYLE` | `auto` | `auto` / `responses` / `chat` |
+| `REQUEST_TIMEOUT` | `90` | 单次请求超时（秒） |
+| `MAX_OUTPUT_TOKENS` | `128` | 输出预算（含推理 token） |
+| `REASONING_EFFORT` | `low` | 推理强度；设为空则不带 `reasoning`/`text` 字段 |
+| `STREAM` | `1` | `1` 走 SSE，`0` 走普通 JSON |
+| `CHAT_TOKEN_PARAM` | `auto` | chat 格式的输出上限字段名 |
+| `CODEX_INSTRUCTION` | 内置中文指令 | 系统指令 |
+| `SLEEP_BETWEEN_TOKENS` | `30` | key 间隔（秒） |
+| `SLEEP_BETWEEN_ROUNDS` | `3000` | 保活轮间隔（秒） |
+| `MAX_DURATION_SEC` | `21500` | 单次运行时长上限（≈5h58m） |
+| `POLL_INTERVAL` | `1800` | 监控轮间隔（秒） |
+| `FAST_THRESHOLD_SEC` | `30` | 提前退出阈值（最大响应秒数） |
+| `QQ_EMAIL` / `QQ_SMTP_AUTH_CODE` | — | 邮件报告，留空则跳过 |
+
+## 工作流
+
+| 工作流 | 触发 | 用途 |
+|---|---|---|
+| **Codex Keepalive** (`keepalive.yml`) | 定时 + 手动 | 每日保活，每 ~50 分钟一轮 |
+| **Codex Keepalive (Once)** (`keepalive-once.yml`) | 手动 | 单轮快速测活 |
+| **Codex Recovery Monitor** (`monitor-recovery.yml`) | 手动 | 每 30 分钟监控 + 恢复即早退 |
+| **Tests** (`test.yml`) | push / PR | `bash -n` + `shellcheck` + `bats` |
 
 ## 本地运行
 
-### 本地单次测试
+需要 **bash ≥ 4**、`jq`、`curl`、`python3`（仅测试需要）。
 
 ```bash
-# 设置 token
-export ANYROUTER_TOKENS="sk-ant-your-token-here"
+# 单 key 测活（最直接的排错入口）
+bash scripts/keepalive.sh "sk-your-key"
+bash scripts/keepalive.sh "sk-your-key" "https://anyrouter.top/v1" "gpt-6-astra" "responses"
 
-# 运行单 token 测活
-bash scripts/keepalive.sh "$ANYROUTER_TOKENS"
-```
+# 查看实际会请求的地址（不发送请求）
+bash -c 'source scripts/lib.sh; resolve_endpoint "https://anyrouter.top/v1" auto; echo "$EP_STYLE $EP_URL"'
 
-### 本地批量运行
+# 单轮批量（跳过 50 分钟等待）
+export CODEX_TOKENS="sk-xxx111
+sk-xxx222"
+bash scripts/run-all.sh --once
 
-```bash
-# 方式 1：使用环境变量
-export ANYROUTER_TOKENS="sk-ant-xxx111
-sk-ant-xxx222"
-export QQ_EMAIL="yourname@qq.com"
-export QQ_SMTP_AUTH_CODE="your_auth_code"
-bash scripts/run-all.sh
-
-# 方式 2：使用 .env 文件
-cp .env.example .env
-# 编辑 .env 填入你的配置
-bash scripts/run-all.sh
-```
-
-### 本地恢复监控
-
-```bash
-# 每 30 分钟轮询，全通且响应 <30s 自动退出
-export ANYROUTER_TOKENS="sk-ant-xxx111
-sk-ant-xxx222"
-export QQ_EMAIL="yourname@qq.com"
-export QQ_SMTP_AUTH_CODE="your_auth_code"
-bash scripts/monitor-recovery.sh
-
-# 调整轮询间隔和运行时长
+# 恢复监控，自定义节奏
 POLL_INTERVAL=600 MAX_DURATION_SEC=3600 bash scripts/monitor-recovery.sh
+
+# 用 .env
+cp .env.example .env
+bash scripts/run-all.sh --once
 ```
 
-### 本地单次快速测试（跳过 50 分钟等待）
+## 测试
 
 ```bash
-export ANYROUTER_TOKENS="sk-ant-test"
-MAX_DURATION_SEC=60 bash scripts/run-all.sh
-```
-
-## 运行测试
-
-```bash
-# 安装 bats（如果未安装）
-npm install -g bats
-
-# 运行测试
+sudo apt-get install -y bats jq    # 或 brew install bats-core jq
 bats tests/
 ```
 
-## 运行时序
-
-### Keepalive
-
-| 时区 | 启动时间 |
-|---|---|
-| UTC | 18:00 |
-| 北京时间 (UTC+8) | 02:00 |
-
-容器启动后内部每 50 分钟轮询一轮，约运行 5 小时 58 分钟后自动退出（配合 GitHub Actions 的 6 小时超时限制）。
-
-### Recovery Monitor
-
-手动触发后每 **30 分钟** 轮询一轮。当全部 token 正常且最大响应时间 < 30 秒时自动提前退出。否则持续运行至 6 小时超时。
+`tests/mock_server.py` 会起一个本地假 Codex 端点（SSE / JSON / 401 三种情况），端到端验证探测与两个编排脚本。
 
 ## 文件结构
 
 ```
 ├── .github/workflows/
-│   ├── keepalive.yml              # 保活工作流（定时 + 手动）
-│   ├── keepalive-once.yml         # 单次测活工作流（手动）
-│   └── monitor-recovery.yml       # 恢复监控工作流（手动）
+│   ├── keepalive.yml            # 定时 + 手动保活
+│   ├── keepalive-once.yml       # 单轮测活
+│   ├── monitor-recovery.yml     # 恢复监控
+│   └── test.yml                 # 语法 / shellcheck / bats
 ├── scripts/
-│   ├── keepalive.sh               # 核心脚本：单 token 测活
-│   ├── run-all.sh                 # 批量运行器：50 分钟轮询
-│   ├── monitor-recovery.sh        # 恢复监控：30 分钟轮询 + 早期退出
-│   └── prompts.txt                # prompt 池（30 条工程 + 30 条轻量）
+│   ├── lib.sh                   # 共享：端点推导、key 加载、SSE/JSON 解析、邮件
+│   ├── keepalive.sh             # 单 key 探测（核心能力）
+│   ├── run-all.sh               # 批量保活（50 分钟轮询）
+│   ├── monitor-recovery.sh      # 恢复监控（30 分钟轮询 + 早退）
+│   └── prompts.txt              # 60 条提问（30 工程 + 30 轻量）
 ├── tests/
-│   └── test_keepalive.bats        # BATS 测试套件
-├── .env.example                   # 本地配置模板
+│   ├── mock_server.py           # 本地假 Codex 端点
+│   └── test_keepalive.bats      # 20 个用例
+├── .env.example
+├── .shellcheckrc
 └── README.md
 ```
 
+## 排错
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `HTTP 404` | 地址路径不对，或该平台不支持 `responses` | 改 `API_STYLE=chat`，或把 `BASE_URL` 换成完整接口地址 |
+| `HTTP 401/403` | key 无效、不是该平台的 key | 检查 `CODEX_TOKENS` 与 `BASE_URL` 是否配套 |
+| `empty answer (status=...)` | 输出预算太小 / 接口返回空 | 提高 `MAX_OUTPUT_TOKENS`（128 → 256/512） |
+| `API error: ...` | 接口返回了错误体（限流、额度、模型不存在） | 按错误文案处理；模型名确认是 `gpt-6-astra` |
+| `curl exit 28` | 请求超时 | 提高 `REQUEST_TIMEOUT`，或确认网络 |
+| 邮件收不到 | SMTP 授权码错 / 用了登录密码 | 重新生成授权码；看日志里的 `Email FAILED` |
+| 全部 key 同时失败 | 平台故障或 key 过期 | 先跑 `keepalive-once` 单轮确认 |
+
+日志里每个 key 都会打印 `HTTP <code> | <秒> | status=<…>`，以及响应体前 800 字节，定位问题不需要复现。
+
 ## 注意事项
 
-- **不要滥用**：保活仅凌晨低峰期运行，恢复监控按需手动触发，频率合理不会对 Anyrouter 造成压力
-- **遵守条款**：请遵守 Anyrouter 的使用条款和服务协议
-- **频率控制**：token 之间间隔 30 秒（带随机抖动），避免触发限流
-- **成本**：每次测活使用 `opus[1m]` 模型，通过 FC 端点直连，单次成本极低
-- **邮箱配置**：QQ 邮箱的 SMTP 授权码请在 QQ 邮箱 → 设置 → 账号 → POP3/IMAP/SMTP 服务 中生成
-- **Prompt 池**：共 60 条 prompt（30 条工程提问 + 30 条轻量级快速问答），每次随机选取一条发送
+- **密钥安全**：key 只出现在 0600 权限的临时请求头文件里，进程退出即删；日志只打印前 5 位。不要把 key 写进 workflow 文件。
+- **成本**：每次探测是一次真实模型调用。`gpt-6-astra` 的单价请按平台计费核对；可用 `MAX_OUTPUT_TOKENS` 压低单次成本。
+- **Actions 分钟数**：每次 6 小时 ≈ 360 分钟，按天跑约 10800 分钟/月。公开仓库免费；私有仓库会远超免费额度（Free 2000 / Pro 3000）。
+- **定时任务**：公开仓库连续 60 天无提交后 schedule 会被自动停用；fork 仓库默认不启用定时任务，需手动开启。
+- **合规**：本工具通过定时请求维持账号活跃度，属于对目标平台调度策略的自动化干预。请自行确认符合 Anyrouter/平台的服务条款与 GitHub Actions 的使用条款，风险自负。
+- **平台差异**：`gpt-6-astra` 是非标准模型名，是否可用完全取决于你配置的 `BASE_URL`；换平台时先跑一次 `keepalive-once`。

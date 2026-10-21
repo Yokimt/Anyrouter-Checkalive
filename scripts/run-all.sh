@@ -1,118 +1,50 @@
 #!/usr/bin/env bash
-# run-all.sh - Batch health-check runner with internal 50-minute loop
-# Designed for a single GitHub Actions container: runs rounds until ~5h58m time limit.
-# Supports local usage via .env file or ANYROUTER_TOKENS env var.
+# run-all.sh - Batch Codex health-check runner with an internal 50-minute loop.
+# Designed for one GitHub Actions container: runs rounds until ~5h58m, then
+# emails a summary. Also usable locally (env vars or .env).
+#
 # Usage: run-all.sh [--once]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
-# --- Parse args ---
 ONCE=false
 if [ "${1:-}" = "--once" ]; then
     ONCE=true
 fi
 
-# --- Configuration ---
-BASE_URL="${BASE_URL:-https://a-ocnfniawgw.cn-shanghai.fcapp.run}"
-MODEL="${MODEL:-opus[1m]}"
-SLEEP_BETWEEN_TOKENS="${SLEEP_BETWEEN_TOKENS:-30}"         # seconds between tokens
-SLEEP_BETWEEN_ROUNDS="${SLEEP_BETWEEN_ROUNDS:-3000}"       # ~50 minutes between rounds
-MAX_DURATION_SEC="${MAX_DURATION_SEC:-21500}"               # ~5h58m (just under 6h limit)
+# --- Configuration ----------------------------------------------------------
+BASE_URL="${CODEX_BASE_URL:-${BASE_URL:-https://anyrouter.top/v1}}"
+MODEL="${CODEX_MODEL:-${MODEL:-gpt-6-astra}}"
+API_STYLE="${CODEX_API_STYLE:-${API_STYLE:-auto}}"
+SLEEP_BETWEEN_TOKENS="${SLEEP_BETWEEN_TOKENS:-30}"     # seconds between keys
+SLEEP_BETWEEN_ROUNDS="${SLEEP_BETWEEN_ROUNDS:-3000}"   # ~50 minutes
+MAX_DURATION_SEC="${MAX_DURATION_SEC:-21500}"          # ~5h58m, under the 6h cap
 QQ_EMAIL="${QQ_EMAIL:-}"
 QQ_SMTP_AUTH_CODE="${QQ_SMTP_AUTH_CODE:-}"
 
-# --- Load tokens ---
-load_tokens() {
-    # 1) Try env var
-    if [ -n "${ANYROUTER_TOKENS:-}" ]; then
-        echo "$ANYROUTER_TOKENS"
-        return
-    fi
-    # 2) Try .env file
-    if [ -f "$SCRIPT_DIR/../.env" ]; then
-        local val
-        val=$(grep -E '^ANYROUTER_TOKENS=' "$SCRIPT_DIR/../.env" 2>/dev/null | sed 's/^ANYROUTER_TOKENS=//' | sed 's/^"//;s/"$//' || true)
-        if [ -n "$val" ]; then
-            echo "$val" | tr ',' '\n'
-            return
-        fi
-    fi
-    echo "ERROR: No tokens found. Set ANYROUTER_TOKENS env var or create .env file." >&2
-    exit 1
-}
-
-# --- Email report ---
-send_email() {
-    local subject="$1" body="$2"
-    if [ -z "$QQ_EMAIL" ] || [ -z "$QQ_SMTP_AUTH_CODE" ]; then
-        echo "  (Skipping email: QQ_EMAIL or QQ_SMTP_AUTH_CODE not configured)"
-        return 0
-    fi
-
-    # Verify curl supports SMTP (GitHub Actions curl usually does)
-    if ! curl --version 2>/dev/null | grep -qi "smtp"; then
-        echo "  Email failed: curl was not compiled with SMTP support"
-        return 1
-    fi
-
-    # Write email to temp file (more reliable than here-string + stdin)
-    local mail_file
-    mail_file=$(mktemp)
-    cat > "$mail_file" <<EOF
-From: $QQ_EMAIL
-To: $QQ_EMAIL
-Subject: $subject
-Content-Type: text/plain; charset=utf-8
-
-$body
-EOF
-
-    echo "  Sending email via QQ SMTP to $QQ_EMAIL ..."
-
-    local curl_exit=0
-    curl -sS --ssl-reqd --fail-with-body \
-        --url "smtps://smtp.qq.com:465" \
-        --user "$QQ_EMAIL:$QQ_SMTP_AUTH_CODE" \
-        --login-options "AUTH=LOGIN" \
-        --mail-from "$QQ_EMAIL" \
-        --mail-rcpt "$QQ_EMAIL" \
-        --upload-file "$mail_file" \
-        || curl_exit=$?
-
-    rm -f "$mail_file"
-
-    if [ "$curl_exit" -eq 0 ]; then
-        echo "  Email sent to $QQ_EMAIL"
-        return 0
-    else
-        echo "  Email FAILED (curl exit: $curl_exit)"
-        echo "  Common causes:"
-        echo "    - QQ_SMTP_AUTH_CODE is wrong (it is NOT your QQ password)"
-        echo "    - Generate it at: QQ Mail -> Settings -> Account -> POP3/IMAP/SMTP"
-        echo "    - Network/firewall blocking smtps://smtp.qq.com:465"
-        return 1
-    fi
-}
-
-# --- Load tokens ---
-TOKENS_DATA=$(load_tokens)
-mapfile -t TOKENS <<< "$TOKENS_DATA"
-if [ ${#TOKENS[@]} -eq 0 ]; then
-    echo "ERROR: No tokens loaded. Exiting." >&2
-    exit 1
+# --- Load keys --------------------------------------------------------------
+if ! KEYS_DATA="$(load_keys)"; then
+    die "No API keys found: set CODEX_TOKENS (one per line) or create .env from .env.example"
 fi
-echo "Loaded ${#TOKENS[@]} token(s)"
+mapfile -t KEYS < <(printf '%s\n' "$KEYS_DATA" | sed '/^[[:space:]]*$/d')
+[ "${#KEYS[@]}" -gt 0 ] || die "No API keys loaded"
+
+echo "Loaded ${#KEYS[@]} key(s)"
 echo "Base URL: $BASE_URL"
 echo "Model: $MODEL"
+echo "API style: $API_STYLE"
 echo ""
 
 START_TIME=$(date +%s)
 ROUND=1
 ALL_RESULTS=""
-HAS_SENT_REPORT=false
+TOTAL_SUCCESS=0
+TOTAL_FAIL=0
 
-while true; do
+while :; do
     NOW=$(date +%s)
     ELAPSED=$((NOW - START_TIME))
     REMAINING=$((MAX_DURATION_SEC - ELAPSED))
@@ -120,6 +52,13 @@ while true; do
     if [ "$REMAINING" -le 0 ]; then
         echo "=== Time limit reached. Exiting. ==="
         break
+    fi
+
+    # Last round before the deadline: run it, then send the report with
+    # everything included (the old build sent the mail one round too early).
+    FINAL_ROUND=false
+    if [ "$REMAINING" -le "$((SLEEP_BETWEEN_ROUNDS + 120))" ]; then
+        FINAL_ROUND=true
     fi
 
     echo "========================================"
@@ -131,33 +70,29 @@ while true; do
     ROUND_SUCCESS=0
     ROUND_FAIL=0
 
-    for i in "${!TOKENS[@]}"; do
-        token="${TOKENS[$i]}"
-        token_preview="${token:0:5}..."
+    for i in "${!KEYS[@]}"; do
+        key="${KEYS[$i]}"
+        preview="${key:0:5}..."
 
-        # Check remaining time before each token
         NOW=$(date +%s)
         if [ $((NOW - START_TIME)) -ge "$MAX_DURATION_SEC" ]; then
             echo "Time limit reached mid-round. Breaking."
             break
         fi
 
-        echo "[$((i+1))/${#TOKENS[@]}] Testing $token_preview ..."
+        echo "[$((i + 1))/${#KEYS[@]}] Testing $preview ..."
 
-        if result=$(bash "$SCRIPT_DIR/keepalive.sh" "$token" "$BASE_URL" "$MODEL" 2>&1); then
-            echo "$result"
-            echo "  ✓ $token_preview is active"
-            ROUND_RESULTS+="  ✓ $token_preview is active"$'\n'
+        if bash "$SCRIPT_DIR/keepalive.sh" "$key" "$BASE_URL" "$MODEL" "$API_STYLE"; then
+            echo "  ✓ $preview is active"
+            ROUND_RESULTS+="  ✓ $preview active"$'\n'
             ROUND_SUCCESS=$((ROUND_SUCCESS + 1))
         else
-            echo "$result"
-            echo "  ✗ $token_preview failed"
-            ROUND_RESULTS+="  ✗ $token_preview failed"$'\n'
+            echo "  ✗ $preview failed"
+            ROUND_RESULTS+="  ✗ $preview failed"$'\n'
             ROUND_FAIL=$((ROUND_FAIL + 1))
         fi
 
-        # Add random jitter to interval (20-40s instead of fixed 30s)
-        if [ "$i" -lt "$(( ${#TOKENS[@]} - 1 ))" ]; then
+        if [ "$i" -lt "$(( ${#KEYS[@]} - 1 ))" ]; then
             JITTER=$(( SLEEP_BETWEEN_TOKENS + (RANDOM % 21) - 10 ))
             [ "$JITTER" -lt 10 ] && JITTER=10
             echo "  Waiting ${JITTER}s ..."
@@ -165,42 +100,28 @@ while true; do
         fi
     done
 
-    # Accumulate round results
+    TOTAL_SUCCESS=$((TOTAL_SUCCESS + ROUND_SUCCESS))
+    TOTAL_FAIL=$((TOTAL_FAIL + ROUND_FAIL))
+
     ALL_RESULTS+="--- Round $ROUND ($(date '+%Y-%m-%d %H:%M')) ---"$'\n'
-    ALL_RESULTS+="$ROUND_RESULTS"$'\n'
+    ALL_RESULTS+="$ROUND_RESULTS"
     ALL_RESULTS+="Round $ROUND summary: $ROUND_SUCCESS success, $ROUND_FAIL failed"$'\n'$'\n'
 
     echo ""
     echo "--- Round $ROUND summary: $ROUND_SUCCESS success, $ROUND_FAIL failed ---"
+    echo ""
 
     ROUND=$((ROUND + 1))
 
-    # If --once mode, exit after the first round
     if [ "$ONCE" = true ]; then
-        echo ""
         echo "=== --once mode: single round complete. Exiting. ==="
         break
     fi
-
-    # Check if we should send final report (last round before time limit)
-    NOW=$(date +%s)
-    ELAPSED=$((NOW - START_TIME))
-    REMAINING=$((MAX_DURATION_SEC - ELAPSED))
-
-    if [ "$REMAINING" -le "$((SLEEP_BETWEEN_ROUNDS + 120))" ] && [ "$HAS_SENT_REPORT" = false ]; then
-        HAS_SENT_REPORT=true
-        echo ""
-        echo "=== Sending final report ==="
-        send_email "Anyrouter Keepalive Report ($(date '+%Y-%m-%d'))" "$ALL_RESULTS" || true
-        echo ""
-
-        # Do one more round if time allows, but signal it's the last
-        if [ "$REMAINING" -le 0 ]; then
-            break
-        fi
+    if [ "$FINAL_ROUND" = true ]; then
+        echo "=== Final round complete. ==="
+        break
     fi
 
-    # Sleep until next round (if we have time)
     NOW=$(date +%s)
     ELAPSED=$((NOW - START_TIME))
     REMAINING=$((MAX_DURATION_SEC - ELAPSED))
@@ -216,16 +137,20 @@ while true; do
     fi
 done
 
-# Final summary
-echo ""
+# --- Final report -----------------------------------------------------------
+SUMMARY="Rounds: $((ROUND - 1))
+Total: ${TOTAL_SUCCESS} success, ${TOTAL_FAIL} failed
+Model: $MODEL
+Endpoint: $BASE_URL
+Finished: $(beijing_ts)
+
+$ALL_RESULTS"
+
 echo "========================================"
 echo " All rounds complete."
 echo "$ALL_RESULTS"
 echo "========================================"
 
-# Send one final report if we never sent one (e.g. very short run)
-if [ "$HAS_SENT_REPORT" = false ]; then
-    send_email "Anyrouter Keepalive Report ($(date '+%Y-%m-%d'))" "$ALL_RESULTS" || true
-fi
+send_email "Codex Keepalive Report ($(date '+%Y-%m-%d'))" "$SUMMARY" || true
 
 echo "Done."

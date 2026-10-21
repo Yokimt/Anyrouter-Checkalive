@@ -1,0 +1,6 @@
+# Keep the checked-out scripts runnable on Linux/macOS even from a Windows clone.
+* text=auto eol=lf
+*.sh text eol=lf
+*.bats text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
