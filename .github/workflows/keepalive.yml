@@ -51,7 +51,9 @@ jobs:
       SLEEP_BETWEEN_ROUNDS: ${{ vars.SLEEP_BETWEEN_ROUNDS }}
       SLEEP_BETWEEN_TOKENS: ${{ vars.SLEEP_BETWEEN_TOKENS }}
       # Hand-off file so the second segment does not notify a second time.
-      REPORT_FILE: ${{ runner.temp }}/keepalive-report.txt
+      # Relative to the workspace: the `runner` context is not allowed in
+      # a job-level env block.
+      REPORT_FILE: .keepalive-report.txt
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -73,15 +75,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: keepalive-part1
-          path: ${{ runner.temp }}/keepalive-report.txt
+          path: .keepalive-report.txt
           if-no-files-found: ignore
           retention-days: 1
 
   keepalive-continue:
     needs: keepalive
-    # Runs even if part 1 failed, so a bad key cannot silently cut the window
-    # short. Set the repository variable KEEPALIVE_EXTEND=false to disable.
-    if: ${{ always() && vars.KEEPALIVE_EXTEND != 'false' }}
+    # Runs when part 1 failed (a bad key must not cut the window short), but NOT
+    # when the whole run was cancelled. `always()` here would resurrect the
+    # second segment after a cancel, which is why cancelling used to look like
+    # it did nothing. Set KEEPALIVE_EXTEND=false to disable this segment.
+    if: ${{ !cancelled() && vars.KEEPALIVE_EXTEND != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 150  # 2h30m, the script stops at ~2h
     env:
@@ -94,7 +98,7 @@ jobs:
       SLEEP_BETWEEN_ROUNDS: ${{ vars.SLEEP_BETWEEN_ROUNDS }}
       SLEEP_BETWEEN_TOKENS: ${{ vars.SLEEP_BETWEEN_TOKENS }}
       # Notifies only when segment 1 never had a success (deduped via REPORT_FILE).
-      REPORT_FILE: ${{ runner.temp }}/keepalive-report.txt
+      REPORT_FILE: .keepalive-report.txt
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -109,7 +113,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: keepalive-part1
-          path: ${{ runner.temp }}
+          path: .
 
       - name: Check configuration
         run: bash scripts/preflight.sh

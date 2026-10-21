@@ -14,6 +14,9 @@ context_manager_example.py
 __pycache__/
 *.pyc
 
+# Workflow hand-off file (see .github/workflows/keepalive.yml)
+.keepalive-report.txt
+
 # OS
 .DS_Store
 Thumbs.db
