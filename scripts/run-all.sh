@@ -153,4 +153,10 @@ echo "========================================"
 
 send_email "Codex Keepalive Report ($(date '+%Y-%m-%d'))" "$SUMMARY" || true
 
+# A run where every key failed is not a success: surface it as a red job.
+if [ "$TOTAL_SUCCESS" -eq 0 ] && [ "$TOTAL_FAIL" -gt 0 ]; then
+    echo "ERROR: every key failed in every round (${TOTAL_FAIL} failures)." >&2
+    exit 1
+fi
+
 echo "Done."

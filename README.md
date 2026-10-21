@@ -77,19 +77,27 @@ x-client-request-id: <uuid4>
 
 ## 快速开始
 
+### 先说明一件事：Actions 不会弹窗让你填密钥
+
+GitHub 的 secret 是**仓库级配置**，不是运行参数。`Run workflow` 面板里的输入框只能传 `base_url`、`model`、`api_style` 这类非敏感参数；密钥必须提前写进 Secrets，否则工作流跑起来第一步就会红，并给出「缺少 API 密钥」的注解。
+
 ### 1. Fork 仓库
 
-### 2. 配置 Secrets
+### 2. 配置 Secrets（必做）
 
-**Settings → Secrets and variables → Actions**：
+**Settings → Secrets and variables → Actions → New repository secret**：
 
 | Secret | 说明 | 必需 |
 |---|---|---|
 | `CODEX_TOKENS` | Codex API key，每行一个 | ✅ |
-| `QQ_EMAIL` | 接收报告的 QQ 邮箱 | ❌ |
-| `QQ_SMTP_AUTH_CODE` | QQ 邮箱 SMTP 授权码（不是登录密码） | ❌ |
+| `QQ_EMAIL` | 接收报告的 QQ 邮箱 | ❌ 可选 |
+| `QQ_SMTP_AUTH_CODE` | QQ 邮箱 SMTP 授权码（不是登录密码） | ❌ 可选 |
 
 > 旧仓库不用改：`ANYROUTER_TOKENS` 仍然可用，工作流会按 `CODEX_TOKENS → ANYROUTER_TOKENS` 顺序回退。
+>
+> **邮件不配也能跑**：`QQ_EMAIL` / `QQ_SMTP_AUTH_CODE` 缺任意一个时，任务照常执行，只是不发邮件，日志里会出现 `(Skipping email: ...)`。想收邮件就把两个都配上，然后在 QQ 邮箱「设置 → 账号 → POP3/IMAP/SMTP」生成授权码。
+
+配好后每次运行会在 Actions 的 **Summary** 页显示本次的端点、格式、模型、key 数量和邮件状态；`preflight.sh` 会在开跑前就把缺项报出来，不用等 6 小时结束才发现。
 
 ### 3. 启用 Actions
 
@@ -127,6 +135,70 @@ Actions 页面 → “I understand my workflows, go ahead and enable them”。
 | **Codex Keepalive (Once)** (`keepalive-once.yml`) | 手动 | 单轮快速测活 |
 | **Codex Recovery Monitor** (`monitor-recovery.yml`) | 手动 | 每 30 分钟监控 + 恢复即早退 |
 | **Tests** (`test.yml`) | push / PR | `bash -n` + `shellcheck` + `bats` |
+
+### 为什么 Actions 里看不到定时运行
+
+这是最常见的疑问，属于正常现象：
+
+- GitHub **只为已发生的触发生成运行记录**，不会提前显示「下一次执行时间」；刚配好时运行列表里只有手动/推送记录。
+- 保活的 cron 是 `0 18 * * *`（UTC）→ 北京时间次日 02:00。所以配好后要等到**下一个 18:00 UTC** 才会出现第一条 `Scheduled` 运行。
+- GitHub 的 cron 允许延迟，高峰时 10–60 分钟属正常，偶尔也会跳过当次。
+- **fork 仓库**的定时工作流默认可能被禁用：到 Actions → Codex Keepalive 看有没有 **Enable workflow** 按钮。
+- 公开仓库连续 60 天无提交后，schedule 会被自动停用（推送一次即可恢复）。
+
+想立刻验证链路，直接点 **Run workflow** （等价于 `workflow_dispatch`），或临时把 cron 改成 `*/5 * * * *` 推上去、验证完再改回来。
+
+## 调整启动时间
+
+**硬限制**：`on.schedule.cron` 只接受字面量 —— 不能用 `${{ vars.* }}`、secret 或 `Run workflow` 的输入框动态生成。启动时间必须写进 YAML，这是 GitHub 的规则。
+
+### 方法 A：脚本换算并改文件（推荐）
+
+```bash
+# 改成北京时间 02:00 启动
+bash scripts/set-cron.sh 02:00
+
+# 只看换算结果，不改文件
+bash scripts/set-cron.sh 07:30 --dry-run
+
+git diff .github/workflows/keepalive.yml
+git add -A && git commit -m "chore: keepalive start at 02:00 Beijing" && git push
+```
+
+脚本负责 北京时间 → UTC 的换算（-8 小时，跨零点自动回绕：`07:30` → `30 23 * * *`），并同步更新 `# keepalive-start:` 注释行。
+
+### 方法 B：网页上直接改
+
+仓库 → `.github/workflows/keepalive.yml` → 铅笔图标 → 只改这一行 → Commit changes 到 `main`：
+
+```yaml
+    # keepalive-start: UTC 18:00 = Beijing 02:00 ...
+    - cron: "0 18 * * *"
+```
+
+### 换算表
+
+| 北京时间 | UTC | cron |
+|---|---|---|
+| 00:00 | 前一天 16:00 | `0 16 * * *` |
+| 02:00 | 前一天 18:00 | `0 18 * * *` |
+| 08:00 | 00:00 | `0 0 * * *` |
+| 12:00 | 04:00 | `0 4 * * *` |
+| 20:00 | 12:00 | `0 12 * * *` |
+| 23:30 | 15:30 | `30 15 * * *` |
+
+一次保活是 6 小时容器：02:00 启动就意味着 02:00–08:00 持续在跑，起得越早越要算 Actions 分钟数。
+
+### 不用改文件的部分
+
+运行时长和节奏可以在 **Settings → Secrets and variables → Actions → Variables** 里建变量，工作流会读取（缺省时脚本自动回落）：
+
+| Variable | 含义 | 默认 |
+|---|---|---|
+| `MAX_DURATION_SEC` | 单次运行时长上限 | 21500（≈5h58m） |
+| `SLEEP_BETWEEN_ROUNDS` | 保活轮间隔秒数 | 3000（≈50 分钟） |
+| `SLEEP_BETWEEN_TOKENS` | key 之间间隔秒数 | 30 |
+| `POLL_INTERVAL` | 监控轮间隔秒数 | 1800 |
 
 ## 本地运行
 
@@ -172,13 +244,15 @@ bats tests/
 │   └── test.yml                 # 语法 / shellcheck / bats
 ├── scripts/
 │   ├── lib.sh                   # 共享：端点推导、key 加载、SSE/JSON 解析、邮件
+│   ├── preflight.sh             # 开跑前检查密钥/端点/邮件配置
+│   ├── set-cron.sh              # 换算并修改定时启动时间
 │   ├── keepalive.sh             # 单 key 探测（核心能力）
 │   ├── run-all.sh               # 批量保活（50 分钟轮询）
 │   ├── monitor-recovery.sh      # 恢复监控（30 分钟轮询 + 早退）
 │   └── prompts.txt              # 60 条提问（30 工程 + 30 轻量）
 ├── tests/
 │   ├── mock_server.py           # 本地假 Codex 端点
-│   └── test_keepalive.bats      # 20 个用例
+│   └── test_keepalive.bats      # 27 个用例
 ├── .env.example
 ├── .shellcheckrc
 └── README.md
@@ -188,6 +262,8 @@ bats tests/
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| Actions 第一步就红：`缺少 API 密钥` | 没建 `CODEX_TOKENS`（或 `ANYROUTER_TOKENS`）secret | Settings → Secrets and variables → Actions 里新建；点开红色注解有完整提示 |
+| 任务成功但收不到邮件 | 未配 `QQ_EMAIL` / `QQ_SMTP_AUTH_CODE`，或授权码用了登录密码 | 日志里会打印 `Skipping email`；补齐两个 secret 并重新生成授权码 |
 | `HTTP 404` | 地址路径不对，或该平台不支持 `responses` | 改 `API_STYLE=chat`，或把 `BASE_URL` 换成完整接口地址 |
 | `HTTP 401/403` | key 无效、不是该平台的 key | 检查 `CODEX_TOKENS` 与 `BASE_URL` 是否配套 |
 | `empty answer (status=...)` | 输出预算太小 / 接口返回空 | 提高 `MAX_OUTPUT_TOKENS`（128 → 256/512） |

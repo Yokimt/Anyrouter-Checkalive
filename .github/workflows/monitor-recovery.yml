@@ -32,6 +32,15 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6h max
+    env:
+      CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
+      BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
+      MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
+      API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
+      POLL_INTERVAL: ${{ github.event.inputs.poll_interval || vars.POLL_INTERVAL }}
+      MAX_DURATION_SEC: ${{ vars.MAX_DURATION_SEC }}
+      QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+      QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -41,13 +50,8 @@ jobs:
           jq --version
           curl --version | head -n 1
 
+      - name: Check configuration
+        run: bash scripts/preflight.sh
+
       - name: Monitor keys for recovery
-        env:
-          CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
-          MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
-          API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
-          POLL_INTERVAL: ${{ github.event.inputs.poll_interval || '1800' }}
-          QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
-          QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
         run: bash scripts/monitor-recovery.sh

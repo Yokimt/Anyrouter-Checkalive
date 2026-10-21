@@ -133,6 +133,42 @@ k2" ]
     [ "$status" -ne 0 ]
 }
 
+# --- workflow configuration -------------------------------------------------
+
+@test "preflight.sh fails without keys and names the secret" {
+    run env CODEX_TOKENS= ANYROUTER_TOKENS= PROJECT_DIR="$BATS_TEST_TMPDIR/none" \
+        bash scripts/preflight.sh
+    [ "$status" -ne 0 ] && [[ "$output" == *"CODEX_TOKENS"* ]]
+}
+
+@test "preflight.sh passes with keys configured" {
+    run env CODEX_TOKENS="sk-test" bash scripts/preflight.sh
+    [ "$status" -eq 0 ] && [[ "$output" == *"配置检查通过"* ]]
+}
+
+# --- start time -------------------------------------------------------------
+
+@test "set-cron.sh converts Beijing 02:00 to 0 18 * * *" {
+    run bash scripts/set-cron.sh "02:00" --dry-run
+    [ "$status" -eq 0 ] && [[ "$output" == *'0 18 * * *'* ]]
+}
+
+@test "set-cron.sh wraps past midnight" {
+    run bash scripts/set-cron.sh "07:30" --dry-run
+    [ "$status" -eq 0 ] && [[ "$output" == *'30 23 * * *'* ]]
+}
+
+@test "set-cron.sh rejects an invalid time" {
+    run bash scripts/set-cron.sh "25:00" --dry-run
+    [ "$status" -ne 0 ]
+}
+
+@test "set-cron.sh rewrites the workflow file" {
+    cp .github/workflows/keepalive.yml "$BATS_TEST_TMPDIR/wf.yml"
+    run bash scripts/set-cron.sh "09:15" --file "$BATS_TEST_TMPDIR/wf.yml"
+    [ "$status" -eq 0 ] && grep -q 'cron: "15 1 \* \* \*"' "$BATS_TEST_TMPDIR/wf.yml"
+}
+
 # --- end to end (mock endpoint) --------------------------------------------
 
 @test "keepalive.sh succeeds against a Codex mock and hides the key" {
@@ -159,6 +195,13 @@ k2" ]
     run env CODEX_TOKENS="sk-test" BASE_URL="http://127.0.0.1:$MOCK_PORT/v1" \
         MODEL="gpt-6-astra" bash scripts/run-all.sh --once
     [ "$status" -eq 0 ] && [[ "$output" == *"Loaded 1 key(s)"* && "$output" == *"Round 1 summary: 1 success"* ]]
+}
+
+@test "run-all.sh --once fails when every key fails" {
+    start_mock
+    run env CODEX_TOKENS="sk-test" BASE_URL="http://127.0.0.1:$MOCK_PORT/reject" \
+        MODEL="gpt-6-astra" MAX_DURATION_SEC=60 bash scripts/run-all.sh --once
+    [ "$status" -ne 0 ] && [[ "$output" == *"every key failed"* ]]
 }
 
 @test "monitor-recovery.sh exits early when everything is healthy and fast" {

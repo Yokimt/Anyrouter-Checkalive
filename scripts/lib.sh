@@ -8,7 +8,7 @@
 # shellcheck disable=SC2034
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$LIB_DIR")"
+PROJECT_DIR="${PROJECT_DIR:-$(dirname "$LIB_DIR")}"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 

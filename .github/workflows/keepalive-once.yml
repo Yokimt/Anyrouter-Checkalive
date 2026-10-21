@@ -27,6 +27,13 @@ jobs:
   keepalive-once:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
+      BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
+      MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
+      API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
+      QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+      QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,12 +43,8 @@ jobs:
           jq --version
           curl --version | head -n 1
 
+      - name: Check configuration
+        run: bash scripts/preflight.sh
+
       - name: Run one keepalive round for all keys
-        env:
-          CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
-          MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
-          API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
-          QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
-          QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
         run: bash scripts/run-all.sh --once

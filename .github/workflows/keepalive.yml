@@ -2,7 +2,7 @@ name: Codex Keepalive
 
 on:
   schedule:
-    # UTC 18:00 = UTC+8 02:00 daily
+    # keepalive-start: UTC 18:00 = Beijing 02:00 (edit with scripts/set-cron.sh "HH:MM")
     - cron: "0 18 * * *"
   workflow_dispatch:
     inputs:
@@ -32,6 +32,19 @@ jobs:
   keepalive:
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6h max, the script self-terminates at ~5h58m
+    env:
+      # Secrets live in Settings -> Secrets and variables -> Actions.
+      # GitHub never prompts for them, and they are never workflow inputs.
+      CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
+      BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
+      MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
+      API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
+      QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+      QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
+      # Optional: override timing from Settings -> Variables (no YAML edit).
+      MAX_DURATION_SEC: ${{ vars.MAX_DURATION_SEC }}
+      SLEEP_BETWEEN_ROUNDS: ${{ vars.SLEEP_BETWEEN_ROUNDS }}
+      SLEEP_BETWEEN_TOKENS: ${{ vars.SLEEP_BETWEEN_TOKENS }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -41,12 +54,8 @@ jobs:
           jq --version
           curl --version | head -n 1
 
+      - name: Check configuration
+        run: bash scripts/preflight.sh
+
       - name: Run keepalive for all keys
-        env:
-          CODEX_TOKENS: ${{ secrets.CODEX_TOKENS || secrets.ANYROUTER_TOKENS }}
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://anyrouter.top/v1' }}
-          MODEL: ${{ github.event.inputs.model || 'gpt-6-astra' }}
-          API_STYLE: ${{ github.event.inputs.api_style || 'auto' }}
-          QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
-          QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
         run: bash scripts/run-all.sh
