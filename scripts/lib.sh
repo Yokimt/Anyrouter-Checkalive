@@ -12,6 +12,24 @@ PROJECT_DIR="${PROJECT_DIR:-$(dirname "$LIB_DIR")}"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Sleep in 30s slices so the log keeps moving (a silent 50-minute sleep looks
+# like a hung job) and a cancel signal is noticed immediately.
+sleep_seconds() {
+    local remaining="$1" slice count=0
+    while [ "$remaining" -gt 0 ]; do
+        slice=30
+        if [ "$remaining" -lt "$slice" ]; then
+            slice="$remaining"
+        fi
+        sleep "$slice"
+        remaining=$((remaining - slice))
+        count=$((count + 1))
+        if [ $((count % 10)) -eq 0 ] && [ "$remaining" -gt 0 ]; then
+            echo "  ... 等待中，剩余 ${remaining}s"
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------

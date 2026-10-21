@@ -71,7 +71,7 @@ x-client-request-id: <uuid4>
 
 ### 保活 / 恢复监控
 
-- **Keepalive**：每天 UTC 18:00（北京时间 02:00）起一个 ~8 小时窗口（6h 主段 + 2h 续段），内部每 ~50 分钟轮询全部 key，每段结束发一封汇总邮件。
+- **Keepalive**：每天 UTC 18:00（北京时间 02:00）起一个 ~8 小时窗口（6h 主段 + 2h 续段），内部每 ~50 分钟轮询全部 key；**第一个 key 成功时就发一封邮件**，不等整个窗口跑完。
 - **Recovery Monitor**：手动起 6 小时容器，每 30 分钟一轮、每轮发邮件；全部 key 正常且最大响应 < 30 秒时发「快用」邮件并提前退出。
 - 每轮 key 之间 30 秒 ± 10 秒抖动，避免瞬时并发。
 
@@ -158,10 +158,38 @@ GitHub 对**单个 job** 有 6 小时（360 分钟）硬上限 —— `MAX_DURAT
 | 2/2 | `keepalive-continue` | 2h（7200s） | `needs` 接在主段之后，`timeout-minutes: 150` |
 
 - 两段之间会有几十秒到几分钟的空档（job 排队 + checkout），不是严格无缝。
-- 每段结束各发一封汇总邮件（一天两封）。
+- 成功通知只在**首次成功的那一刻**发一封（第一段发过，第二段不重复）。
 - 主段即使失败，续段仍会执行（`always()`），避免一个坏 key 把窗口砍短。
 - **退回 6 小时**：Settings → Variables 加 `KEEPALIVE_EXTEND = false`，续段就不跑了。
 - 想更长就再串一个 job，但要按每天 480 分钟以上计算 Actions 消耗。
+
+### 邮件通知规则
+
+| 场景 | 是否发邮件 |
+|---|---|
+| 第一个 key 成功的那一刻 | ✅ 立即发一封（不等跑完、不等整轮结束） |
+| 同一次运行里后面再成功 | ❌ 不重复 |
+| 8h 双段：第二段 | ❌ 第一段已发过就跳过（靠 `REPORT_FILE` 交接判断） |
+| 所有 key 都失败 | ❌ 不发（job 变红，GitHub 自己的失败通知兜底） |
+| `SEND_REPORT=0` 的段落 | ❌ 不发 |
+| 任务被取消/超时，或 `preflight.sh` 失败 | ❌ 不发 |
+| 没配 `QQ_EMAIL` / `QQ_SMTP_AUTH_CODE` | ❌ 不发，日志打印 `Skipping email` |
+
+邮件正文包含：成功时间、模型、端点、key 前 5 位、响应耗时、第几轮。
+
+### 在网页哪里看 cron
+
+GitHub 界面**没有**定时任务面板，也不会显示「下一次执行时间」——cron 只存在于工作流文件里：
+
+**仓库 → Code → `.github/workflows/keepalive.yml`**，看第 4–6 行：
+
+```yaml
+  schedule:
+    # keepalive-start: UTC 18:00 = Beijing 02:00 ...
+    - cron: "0 18 * * *"
+```
+
+判断它真的生效，只能看 Actions → Codex Keepalive → 运行列表里是否出现 `event = Scheduled` 的记录。
 
 ## 调整启动时间
 
@@ -268,7 +296,7 @@ bats tests/
 │   └── prompts.txt              # 60 条提问（30 工程 + 30 轻量）
 ├── tests/
 │   ├── mock_server.py           # 本地假 Codex 端点
-│   └── test_keepalive.bats      # 27 个用例
+│   └── test_keepalive.bats      # 33 个用例
 ├── .env.example
 ├── .shellcheckrc
 └── README.md
@@ -278,8 +306,9 @@ bats tests/
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| 取消任务后日志还停在 `Sleeping 3000s` | 轮间等待是长睡眠，旧版本没有信号处理 | 新版改成 30 秒分片 + `trap`，取消后几秒内退出；旧运行只能重试取消或等这一轮结束 |
 | Actions 第一步就红：`缺少 API 密钥` | 没建 `CODEX_TOKENS`（或 `ANYROUTER_TOKENS`）secret | Settings → Secrets and variables → Actions 里新建；点开红色注解有完整提示 |
-| 任务成功但收不到邮件 | 未配 `QQ_EMAIL` / `QQ_SMTP_AUTH_CODE`，或授权码用了登录密码 | 日志里会打印 `Skipping email`；补齐两个 secret 并重新生成授权码 |
+| 任务成功但收不到邮件 | 所有 key 都失败（按规则不发）、未配 `QQ_EMAIL`/`QQ_SMTP_AUTH_CODE`，或授权码用了登录密码 | 先看日志里的 `(email skipped)` / `Skipping email`；全失败属预期，补齐 secret 并重新生成授权码 |
 | `HTTP 404` | 地址路径不对，或该平台不支持 `responses` | 改 `API_STYLE=chat`，或把 `BASE_URL` 换成完整接口地址 |
 | `HTTP 401/403` | key 无效、不是该平台的 key | 检查 `CODEX_TOKENS` 与 `BASE_URL` 是否配套 |
 | `empty answer (status=...)` | 输出预算太小 / 接口返回空 | 提高 `MAX_OUTPUT_TOKENS`（128 → 256/512） |

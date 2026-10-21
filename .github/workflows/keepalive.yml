@@ -29,8 +29,10 @@ concurrency:
   cancel-in-progress: false
 
 # Why two jobs: GitHub caps a single job at 6 hours (360 minutes), so an
-# 8-hour window is built from a ~6h job followed by a ~2h job. Set the
-# repository variable KEEPALIVE_EXTEND=false to keep only the first segment.
+# 8-hour window is built from a ~6h job followed by a ~2h job. The success
+# email is sent the moment the first key succeeds, so a normal day produces
+# exactly one notification. Set the repository variable KEEPALIVE_EXTEND=false
+# to keep only the first segment.
 jobs:
   keepalive:
     runs-on: ubuntu-latest
@@ -48,6 +50,8 @@ jobs:
       MAX_DURATION_SEC: ${{ vars.MAX_DURATION_SEC }}
       SLEEP_BETWEEN_ROUNDS: ${{ vars.SLEEP_BETWEEN_ROUNDS }}
       SLEEP_BETWEEN_TOKENS: ${{ vars.SLEEP_BETWEEN_TOKENS }}
+      # Hand-off file so the second segment does not notify a second time.
+      REPORT_FILE: ${{ runner.temp }}/keepalive-report.txt
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -62,6 +66,16 @@ jobs:
 
       - name: Run keepalive for all keys (part 1/2)
         run: bash scripts/run-all.sh
+
+      - name: Upload partial report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepalive-part1
+          path: ${{ runner.temp }}/keepalive-report.txt
+          if-no-files-found: ignore
+          retention-days: 1
 
   keepalive-continue:
     needs: keepalive
@@ -79,6 +93,8 @@ jobs:
       QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
       SLEEP_BETWEEN_ROUNDS: ${{ vars.SLEEP_BETWEEN_ROUNDS }}
       SLEEP_BETWEEN_TOKENS: ${{ vars.SLEEP_BETWEEN_TOKENS }}
+      # Notifies only when segment 1 never had a success (deduped via REPORT_FILE).
+      REPORT_FILE: ${{ runner.temp }}/keepalive-report.txt
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -87,6 +103,13 @@ jobs:
         run: |
           jq --version
           curl --version | head -n 1
+
+      - name: Download part 1 report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: keepalive-part1
+          path: ${{ runner.temp }}
 
       - name: Check configuration
         run: bash scripts/preflight.sh

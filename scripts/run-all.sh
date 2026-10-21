@@ -44,6 +44,43 @@ ALL_RESULTS=""
 TOTAL_SUCCESS=0
 TOTAL_FAIL=0
 
+# Stop promptly when the run is cancelled from the Actions UI (SIGINT/SIGTERM)
+# instead of sitting inside a 50-minute sleep.
+trap 'echo ""; echo "=== 收到取消信号，停止保活 ==="; exit 130' INT TERM
+
+# Notification: exactly one email, sent the moment the first key succeeds.
+#   REPORT_FILE  optional hand-off file so chained jobs do not notify twice
+#   SEND_REPORT  0 = this segment never notifies
+REPORT_FILE="${REPORT_FILE:-}"
+SEND_REPORT="${SEND_REPORT:-1}"
+
+PREVIOUS_REPORT=""
+PREV_HAD_SUCCESS=false
+if [ -n "$REPORT_FILE" ] && [ -f "$REPORT_FILE" ]; then
+    PREVIOUS_REPORT=$(cat "$REPORT_FILE")
+    if printf '%s' "$PREVIOUS_REPORT" | grep -q ' active'; then
+        PREV_HAD_SUCCESS=true
+    fi
+fi
+
+NOTIFIED=false
+
+# Fired the moment a key succeeds, not after the whole run finishes.
+notify_success() {
+    local preview="$1" response_time="$2" round="$3" body
+    body="Codex 保活成功，账号已激活。
+
+时间: $(beijing_ts)
+模型: $MODEL
+端点: $BASE_URL
+key:  ${preview}
+响应: ${response_time}s
+轮次: 第 ${round} 轮
+
+本次运行后续轮次不再重复发送。"
+    send_email "Codex 保活成功 $(date '+%m-%d %H:%M')" "$body"
+}
+
 while :; do
     NOW=$(date +%s)
     ELAPSED=$((NOW - START_TIME))
@@ -82,10 +119,18 @@ while :; do
 
         echo "[$((i + 1))/${#KEYS[@]}] Testing $preview ..."
 
+        CHECK_START=$(date +%s)
         if bash "$SCRIPT_DIR/keepalive.sh" "$key" "$BASE_URL" "$MODEL" "$API_STYLE"; then
-            echo "  ✓ $preview is active"
-            ROUND_RESULTS+="  ✓ $preview active"$'\n'
+            RESPONSE_TIME=$(( $(date +%s) - CHECK_START ))
+            echo "  ✓ $preview is active (${RESPONSE_TIME}s)"
+            ROUND_RESULTS+="  ✓ $preview active (${RESPONSE_TIME}s)"$'\n'
             ROUND_SUCCESS=$((ROUND_SUCCESS + 1))
+            if [ "$NOTIFIED" = false ] && [ "$PREV_HAD_SUCCESS" != true ] && [ "$SEND_REPORT" != "0" ]; then
+                if notify_success "$preview" "$RESPONSE_TIME" "$ROUND"; then
+                    NOTIFIED=true
+                    echo "  → 成功通知已处理"
+                fi
+            fi
         else
             echo "  ✗ $preview failed"
             ROUND_RESULTS+="  ✗ $preview failed"$'\n'
@@ -96,7 +141,7 @@ while :; do
             JITTER=$(( SLEEP_BETWEEN_TOKENS + (RANDOM % 21) - 10 ))
             [ "$JITTER" -lt 10 ] && JITTER=10
             echo "  Waiting ${JITTER}s ..."
-            sleep "$JITTER"
+            sleep_seconds "$JITTER"
         fi
     done
 
@@ -128,30 +173,41 @@ while :; do
 
     if [ "$REMAINING" -gt "$SLEEP_BETWEEN_ROUNDS" ]; then
         echo "Sleeping ${SLEEP_BETWEEN_ROUNDS}s until round $ROUND ..."
-        sleep "$SLEEP_BETWEEN_ROUNDS"
+        sleep_seconds "$SLEEP_BETWEEN_ROUNDS"
     elif [ "$REMAINING" -gt 60 ]; then
         echo "Sleeping ${REMAINING}s (remaining time) ..."
-        sleep "$REMAINING"
+        sleep_seconds "$REMAINING"
     else
         echo "Time limit reached."
     fi
 done
 
-# --- Final report -----------------------------------------------------------
-SUMMARY="Rounds: $((ROUND - 1))
+# --- Wrap up ----------------------------------------------------------------
+CURRENT_BLOCK="--- $(beijing_ts) ---
+Rounds: $((ROUND - 1))
 Total: ${TOTAL_SUCCESS} success, ${TOTAL_FAIL} failed
-Model: $MODEL
-Endpoint: $BASE_URL
-Finished: $(beijing_ts)
 
 $ALL_RESULTS"
+
+# Hand this segment to the next chained job so it does not notify twice.
+if [ -n "$REPORT_FILE" ]; then
+    printf '%s\n' "$CURRENT_BLOCK" >> "$REPORT_FILE"
+fi
 
 echo "========================================"
 echo " All rounds complete."
 echo "$ALL_RESULTS"
 echo "========================================"
 
-send_email "Codex Keepalive Report ($(date '+%Y-%m-%d'))" "$SUMMARY" || true
+if [ "$NOTIFIED" = true ]; then
+    echo "(成功通知已在首次成功时发送，结束时不再重复)"
+elif [ "$SEND_REPORT" = "0" ]; then
+    echo "(SEND_REPORT=0：本段不发送通知)"
+elif [ "$PREV_HAD_SUCCESS" = true ]; then
+    echo "(上一段已发送过成功通知，本段不重复发送)"
+else
+    echo "(本次没有成功通知：没有任何 key 成功)"
+fi
 
 # A run where every key failed is not a success: surface it as a red job.
 if [ "$TOTAL_SUCCESS" -eq 0 ] && [ "$TOTAL_FAIL" -gt 0 ]; then

@@ -169,6 +169,52 @@ k2" ]
     [ "$status" -eq 0 ] && grep -q 'cron: "15 1 \* \* \*"' "$BATS_TEST_TMPDIR/wf.yml"
 }
 
+@test "run-all.sh does not email when nothing succeeded" {
+    start_mock
+    run env CODEX_TOKENS="sk-test" BASE_URL="http://127.0.0.1:$MOCK_PORT/reject" \
+        MODEL="gpt-6-astra" MAX_DURATION_SEC=60 bash scripts/run-all.sh --once
+    [ "$status" -ne 0 ] && [[ "$output" == *"没有任何 key 成功"* ]]
+}
+
+@test "run-all.sh stays silent when SEND_REPORT=0" {
+    start_mock
+    run env CODEX_TOKENS="sk-test" BASE_URL="http://127.0.0.1:$MOCK_PORT/v1" \
+        MODEL="gpt-6-astra" MAX_DURATION_SEC=60 SEND_REPORT=0 \
+        bash scripts/run-all.sh --once
+    [ "$status" -eq 0 ] && [[ "$output" == *"SEND_REPORT=0"* ]]
+}
+
+@test "run-all.sh notifies as soon as a key succeeds" {
+    start_mock
+    run env CODEX_TOKENS="sk-test" BASE_URL="http://127.0.0.1:$MOCK_PORT/v1" \
+        MODEL="gpt-6-astra" MAX_DURATION_SEC=60 bash scripts/run-all.sh --once
+    [ "$status" -eq 0 ] && [[ "$output" == *"成功通知已处理"* && "$output" == *"Skipping email"* ]]
+}
+
+@test "run-all.sh does not notify twice across chained segments" {
+    start_mock
+    local report="$BATS_TEST_TMPDIR/report.txt"
+    printf '  ✓ sk-te... active (1s)\n' > "$report"
+    run env CODEX_TOKENS="sk-test" BASE_URL="http://127.0.0.1:$MOCK_PORT/v1" \
+        MODEL="gpt-6-astra" MAX_DURATION_SEC=60 REPORT_FILE="$report" \
+        bash scripts/run-all.sh --once
+    [ "$status" -eq 0 ] && [[ "$output" == *"上一段已发送过成功通知"* ]]
+}
+
+@test "run-all.sh hands the report to the next segment" {
+    start_mock
+    local report="$BATS_TEST_TMPDIR/report.txt"
+    run env CODEX_TOKENS="sk-test" BASE_URL="http://127.0.0.1:$MOCK_PORT/v1" \
+        MODEL="gpt-6-astra" MAX_DURATION_SEC=60 SEND_REPORT=0 REPORT_FILE="$report" \
+        bash scripts/run-all.sh --once
+    [ "$status" -eq 0 ] && grep -q 'Total: 1 success' "$report"
+}
+
+@test "sleep_seconds sleeps in slices" {
+    run bash -c 'source scripts/lib.sh; sleep_seconds 2; echo done'
+    [ "$status" -eq 0 ] && [[ "$output" == *"done"* ]]
+}
+
 # --- end to end (mock endpoint) --------------------------------------------
 
 @test "keepalive.sh succeeds against a Codex mock and hides the key" {

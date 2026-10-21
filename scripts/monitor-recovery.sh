@@ -35,6 +35,9 @@ echo "Poll interval: ${POLL_INTERVAL}s"
 echo ""
 
 START_TIME=$(date +%s)
+
+# Stop promptly when cancelled from the Actions UI.
+trap 'echo ""; echo "=== 收到取消信号，停止监控 ==="; exit 130' INT TERM
 ROUND=1
 COMPLETED_ROUNDS=0
 
@@ -92,7 +95,7 @@ while :; do
             JITTER=$(( SLEEP_BETWEEN_TOKENS + (RANDOM % 21) - 10 ))
             [ "$JITTER" -lt 10 ] && JITTER=10
             echo "  Waiting ${JITTER}s ..."
-            sleep "$JITTER"
+            sleep_seconds "$JITTER"
         fi
     done
 
@@ -163,11 +166,11 @@ $ROUND_SUMMARY
     if [ "$REMAINING" -gt "$POLL_INTERVAL" ]; then
         echo ""
         echo "--- Next round in ${POLL_INTERVAL}s ($((POLL_INTERVAL / 60)) min) ---"
-        sleep "$POLL_INTERVAL"
+        sleep_seconds "$POLL_INTERVAL"
     elif [ "$REMAINING" -gt 60 ]; then
         echo ""
         echo "--- Time nearly up, sleeping final ${REMAINING}s ---"
-        sleep "$REMAINING"
+        sleep_seconds "$REMAINING"
     else
         echo "Time limit reached."
     fi
